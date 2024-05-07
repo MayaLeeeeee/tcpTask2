@@ -2,7 +2,6 @@
 #include "../obj/common.h"
 #include "../obj/packet.h"
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +25,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, client_addr;
     char buffer[BUF_SIZE];
     socklen_t addr_len = sizeof(client_addr);
+    int ack_num = 0;
 
     // Setup socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -54,8 +54,6 @@ int main(int argc, char *argv[]) {
             exit(1);
         }
 
-        //printf("Waiting to receive a file...\n");
-
         int receiving = 1;
         while (receiving) {
             // Receive data
@@ -68,9 +66,8 @@ int main(int argc, char *argv[]) {
             // If an empty packet is received, it indicates the end of the transmission
             if (len == 0) {
                 receiving = 0;
-				char *ack = "ACK";
-                sendto(sockfd, ack, strlen(ack), 0, (struct sockaddr *)&client_addr, addr_len);
-				printf("sent final ACK\n");
+				sendto(sockfd, &ack_num, sizeof(ack_num), 0, (struct sockaddr *)&client_addr, addr_len);
+				//ack_num++;
             } else {
                 // Write data to file
 				printf("received: %s\n", buffer);
@@ -78,15 +75,12 @@ int main(int argc, char *argv[]) {
                 fflush(file);
 
                 // Send ACK
-                char *ack = "ACK";
-                sendto(sockfd, ack, strlen(ack), 0, (struct sockaddr *)&client_addr, addr_len);
-				//write to file not working => we integrate write to file function here 
-				printf("sent ACK\n");
+                sendto(sockfd, &ack_num, sizeof(ack_num), 0, (struct sockaddr *)&client_addr, addr_len);
+                ack_num++;
             }
         }
 
         fclose(file);
-        //printf("Finished receiving a file. Waiting for the next sender...\n");
     }
 
     close(sockfd);

@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <math.h>
+#include <stdbool.h>
 
 #define MAX_RETRANSMISSIONS 5
 #define INITIAL_RTO 3
@@ -28,6 +29,40 @@ double estimated_rtt = 0.0, dev_rtt = 0.0;
 double rto = INITIAL_RTO;
 int retransmissions = 0;
 
+// Congestion control variables
+double cwnd = 1.0;
+int ssthresh = 64;
+int dup_acks = 0;
+int last_ack = -1;
+bool slow_start = true;
+
+// CSV logging variables and functions
+#include <stdbool.h>
+FILE *csv_file;
+
+bool initialize_csv_logging(const char *csv_path) {
+    csv_file = fopen(csv_path, "w");
+    if (!csv_file) {
+        perror("fopen()");
+        return false;
+    }
+    fprintf(csv_file, "cwnd,ssthresh,rto,retransmissions\n");
+    fflush(csv_file);
+    return true;
+}
+
+void record_csv_logging(double cwnd, int ssthresh, double rto, int retransmissions) {
+    fprintf(csv_file, "%d,%d,%d,%d\n", (int)cwnd, ssthresh, (int)rto, retransmissions);
+    fflush(csv_file);
+}
+
+void close_csv_logging() {
+    if (csv_file) {
+        fclose(csv_file);
+    }
+}
+
+// Function to calculate the retransmission timeout (RTO)
 void calculate_rto(double sample_rtt) {
     if (estimated_rtt == 0.0) {
         // First measurement
@@ -44,41 +79,68 @@ void calculate_rto(double sample_rtt) {
     if (rto > MAX_RTO) rto = MAX_RTO;
 }
 
-int send_packet(char *data, int len) {
-    // Start timer
+// Function to adjust the congestion window
+void adjust_cwnd(int ack_num) {
+    record_csv_logging(cwnd, ssthresh, rto, retransmissions);
+
+    if (ack_num == last_ack) {
+        dup_acks++;
+        if (dup_acks == 3) {
+            // Fast Retransmit
+            ssthresh = fmax(cwnd / 2, 2);
+            cwnd = 1;
+            dup_acks = 0;
+            slow_start = true;
+            fprintf(stderr, "Fast Retransmit triggered: ssthresh = %d, cwnd = %f\n", ssthresh, cwnd);
+        }
+    } else {
+        dup_acks = 0;
+        last_ack = ack_num;
+
+        if (slow_start) {
+            cwnd += 1.0;
+            if (cwnd >= ssthresh) {
+                slow_start = false;
+                fprintf(stderr, "Switching to Congestion Avoidance\n");
+            }
+        } else {
+            cwnd += 1.0 / cwnd;
+        }
+    }
+}
+
+// Function to send a packet and manage retransmissions
+int send_packet(const char *data, size_t len) {
+    int sent_bytes = sendto(sockfd, data, len, 0, (struct sockaddr *)&server_addr, addr_len);
+    if (sent_bytes < 0) {
+        perror("sendto()");
+        return -1;
+    }
+
     gettimeofday(&start, NULL);
 
-    // Send packet
-    sendto(sockfd, data, len, 0, (struct sockaddr *)&server_addr, addr_len);
+    // Wait for acknowledgment
+    char ack_buf[BUF_SIZE];
+    struct timeval timeout;
+    timeout.tv_sec = (int)rto;
+    timeout.tv_usec = (int)((rto - timeout.tv_sec) * 1000000);
 
-    // Receive ACK
     fd_set readfds;
     FD_ZERO(&readfds);
     FD_SET(sockfd, &readfds);
 
-    struct timeval timeout;
-    timeout.tv_sec = (int)rto;
-    timeout.tv_usec = (int)((rto - (int)rto) * 1000000);
-
-    int retval = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
-    if (retval == -1) {
-        perror("select()");
-        return -1;
-    } else if (retval) {
-        // Packet ACKed
-        recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&server_addr, &addr_len);
-
-        // Calculate RTT
-        gettimeofday(&end, NULL);
-        double sample_rtt = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
-
-        // Update RTO using RTT estimator (Karn's Algorithm)
-        if (retransmissions == 0) {
+    int result = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+    if (result > 0 && FD_ISSET(sockfd, &readfds)) {
+        int received_bytes = recvfrom(sockfd, ack_buf, BUF_SIZE, 0, (struct sockaddr *)&server_addr, &addr_len);
+        if (received_bytes > 0) {
+            int ack_num = atoi(ack_buf);
+            gettimeofday(&end, NULL);
+            double sample_rtt = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_usec - start.tv_usec) / 1000.0;
             calculate_rto(sample_rtt);
+            adjust_cwnd(ack_num);
+            retransmissions = 0;
+            return sent_bytes;
         }
-
-        retransmissions = 0;
-        return 0;  // Successfully sent and acknowledged
     } else {
         // Timeout occurred, retransmit with exponential backoff
         retransmissions++;
@@ -95,6 +157,7 @@ int send_packet(char *data, int len) {
         fprintf(stderr, "Timeout, retransmitting...\n");
         return send_packet(data, len);
     }
+    return -1;
 }
 
 int main(int argc, char *argv[]) {
@@ -128,23 +191,35 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    // Initialize CSV logging
+    const char *csv_path = "CWND.csv";
+    if (!initialize_csv_logging(csv_path)) {
+        fclose(file);
+        close(sockfd);
+        exit(1);
+    }
+
     // Read and send the file in chunks
     size_t bytes_read;
     while ((bytes_read = fread(buffer, 1, BUF_SIZE, file)) > 0) {
-		printf("sending: %s\n", buffer);
-        if (send_packet(buffer, bytes_read) < 0) {
-            fprintf(stderr, "Error sending data\n");
-            fclose(file);
-            close(sockfd);
-            exit(1);
+        int packets_to_send = (int)floor(cwnd);
+        for (int i = 0; i < packets_to_send; ++i) {
+            if (send_packet(buffer, bytes_read) < 0) {
+                fprintf(stderr, "Error sending data\n");
+                fclose(file);
+                close(sockfd);
+                close_csv_logging();
+                exit(1);
+            }
         }
     }
-	printf("outside while loop\n");
+
     // Send an empty packet to signal the end of transmission
     send_packet("", 0);
 
     fclose(file);
     close(sockfd);
+    close_csv_logging();
     printf("File sent successfully. Exiting sender.\n");
     return 0;
 }
